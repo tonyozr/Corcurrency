@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "Swift toolchain clang (Windows)",
+            "compilerPath": "${env:LOCALAPPDATA}/Programs/Swift/Toolchains/6.3.3+Asserts/usr/bin/clang++.exe",
+            "compilerArgs": ["-target", "x86_64-unknown-windows-msvc"],
+            "intelliSenseMode": "windows-clang-x64",
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "includePath": [
+                "${workspaceFolder}/Sources/Corcurrency/include"
+            ],
+            "defines": [
+                "SWIFT_PACKAGE=1",
+                "DEBUG=1",
+                "_MT",
+                "_DLL"
+            ]
+        }
+    ],
+    "version": 4
+}

@@ -1,0 +1,62 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Corcurrency: Build (debug)",
+            "type": "shell",
+            "command": "swift build",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Corcurrency: Build (release)",
+            "type": "shell",
+            "command": "swift build -c release",
+            "group": "build",
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Corcurrency: Run tests",
+            "type": "shell",
+            "command": "swift run CorcurrencyTests",
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Corcurrency: Run example",
+            "type": "shell",
+            "command": "swift run Example",
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Corcurrency: Run threads demo",
+            "type": "shell",
+            "command": "swift run ThreadsDemo",
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Corcurrency: Run sync example",
+            "type": "shell",
+            "command": "swift run SyncExample",
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Corcurrency: Run Swift example",
+            "type": "shell",
+            "command": "swift run SwiftExample",
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Corcurrency: Clean",
+            "type": "shell",
+            "command": "swift package clean",
+            "problemMatcher": []
+        }
+    ]
+}

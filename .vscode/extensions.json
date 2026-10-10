@@ -1,0 +1,7 @@
+{
+    "recommendations": [
+        "swiftlang.swift-vscode",
+        "ms-vscode.cpptools",
+        "llvm-vs-code-extensions.lldb-dap"
+    ]
+}

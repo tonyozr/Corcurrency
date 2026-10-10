@@ -1,0 +1,104 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Debug Example",
+            "target": "Example",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Example"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Release Example",
+            "target": "Example",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Example"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Debug CorcurrencyTests",
+            "target": "CorcurrencyTests",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CorcurrencyTests"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Release CorcurrencyTests",
+            "target": "CorcurrencyTests",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CorcurrencyTests"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Debug SyncExample",
+            "target": "SyncExample",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SyncExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Release SyncExample",
+            "target": "SyncExample",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SyncExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Debug SwiftExample",
+            "target": "SwiftExample",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SwiftExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Release SwiftExample",
+            "target": "SwiftExample",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SwiftExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Debug ThreadsDemo",
+            "target": "ThreadsDemo",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug ThreadsDemo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Corcurrency}",
+            "name": "Release ThreadsDemo",
+            "target": "ThreadsDemo",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release ThreadsDemo"
+        }
+    ]
+}

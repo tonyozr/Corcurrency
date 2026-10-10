@@ -1,0 +1,6 @@
+// Headers are C++ templates; keep them textual so that SwiftPM's generated
+// module map does not force clang modules onto C++ dependents.
+module Corcurrency {
+    textual header "corcurrency/corcurrency.hpp"
+    export *
+}

@@ -1,0 +1,35 @@
+{
+    // C++ IntelliSense comes from ms-vscode.cpptools (see c_cpp_properties.json);
+    // keep SourceKit-LSP to Swift (Package.swift) so diagnostics are not duplicated.
+    "swift.sourcekit-lsp.supported-languages": ["swift"],
+
+    "files.associations": {
+        "*.hpp": "cpp",
+        "*.cpp": "cpp",
+        "module.modulemap": "plaintext"
+    },
+    "files.exclude": {
+        "**/.build": true,
+        "**/.swiftpm": true
+    },
+    "files.watcherExclude": {
+        "**/.build/**": true
+    },
+    "search.exclude": {
+        "**/.build": true
+    },
+    "files.insertFinalNewline": true,
+    "files.trimTrailingWhitespace": true,
+    "files.eol": "\n",
+
+    "[cpp]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.rulers": [120],
+        "editor.defaultFormatter": "ms-vscode.cpptools"
+    },
+    "C_Cpp.formatting": "clangFormat",
+    "C_Cpp.clang_format_fallbackStyle": "{ BasedOnStyle: LLVM, IndentWidth: 4, ColumnLimit: 120, AccessModifierOffset: -4, AllowShortFunctionsOnASingleLine: Inline, NamespaceIndentation: None }",
+    "C_Cpp.default.cppStandard": "c++20",
+    "C_Cpp.errorSquiggles": "enabled"
+}
