@@ -127,3 +127,7 @@ independent.
 The public headers don't include `<dispatch/dispatch.h>`; only `runtime.cpp` talks to libdispatch. If the
 header isn't on the include path (SwiftPM doesn't add the Swift SDK's include directory for C++ targets),
 the runtime declares the few libdispatch C functions it uses itself.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
