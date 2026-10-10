@@ -16,12 +16,30 @@ let package = Package(
     name: "Corcurrency",
     products: [
         .library(name: "Corcurrency", targets: ["Corcurrency"]),
+        // The runtime as a .dll / .so / .dylib for projects outside SwiftPM:
+        // `swift build -c release --product CorcurrencyShared`. Its users
+        // compile against Sources/Corcurrency/include with CORCURRENCY_SHARED
+        // defined (see corcurrency/config.hpp).
+        .library(name: "CorcurrencyShared", type: .dynamic, targets: ["CorcurrencyShared"]),
     ],
     targets: [
         .target(
             name: "Corcurrency",
             linkerSettings: [
                 .linkedLibrary("dispatch", .when(platforms: [.windows, .linux, .android, .openbsd])),
+            ]
+        ),
+        .target(
+            name: "CorcurrencyShared",
+            publicHeadersPath: ".", // no headers of its own: users take Sources/Corcurrency/include
+            cxxSettings: [
+                .define("CORCURRENCY_SHARED"),
+                .define("CORCURRENCY_BUILDING"),
+            ],
+            linkerSettings: [
+                .linkedLibrary("dispatch", .when(platforms: [.windows, .linux, .android, .openbsd])),
+                // SwiftPM links swiftrt.obj into the DLL as well.
+                .linkedLibrary("swiftCore", .when(platforms: [.windows])),
             ]
         ),
         .executableTarget(

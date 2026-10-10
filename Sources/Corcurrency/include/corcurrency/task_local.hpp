@@ -20,12 +20,10 @@ namespace corcurrency {
 
 namespace detail {
 
-inline thread_local std::shared_ptr<const TaskLocalNode> threadLocals;
-
 /// The binding list of the current task (or of the thread outside any task).
 inline std::shared_ptr<const TaskLocalNode>& currentLocals() {
     auto* task = currentContext().task;
-    return task ? task->locals : threadLocals;
+    return task ? task->locals : threadTaskLocals();
 }
 
 } // namespace detail

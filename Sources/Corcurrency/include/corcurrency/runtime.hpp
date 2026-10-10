@@ -1,6 +1,8 @@
 // C++ Corcurrency — runtime core: priorities, executors, jobs and task records.
 #pragma once
 
+#include "config.hpp"
+
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
@@ -9,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -29,7 +32,7 @@ enum class TaskPriority : std::uint8_t {
 // MARK: - CancellationError
 
 /// Thrown by `Task<>::checkCancellation()`, `Task<>::sleep(...)` etc.
-struct CancellationError : std::exception {
+struct CORCURRENCY_API CancellationError : std::exception {
     const char* what() const noexcept override { return "CancellationError"; }
 };
 
@@ -81,18 +84,18 @@ public:
     bool isCancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
 
     /// Cancels this task, runs its cancellation handlers and cancels its child tasks.
-    void cancel();
+    CORCURRENCY_API void cancel();
 
     /// Unique id for `addCancellationHandler`.
-    static std::uint64_t makeHandlerId() noexcept;
+    CORCURRENCY_API static std::uint64_t makeHandlerId() noexcept;
 
     /// Returns false (and does not register) if the task is already cancelled.
-    bool addCancellationHandler(std::uint64_t id, std::function<void()> handler);
-    void removeCancellationHandler(std::uint64_t id);
+    CORCURRENCY_API bool addCancellationHandler(std::uint64_t id, std::function<void()> handler);
+    CORCURRENCY_API void removeCancellationHandler(std::uint64_t id);
 
     /// Structured children (task group / async let) are cancelled with the parent.
-    void addChild(TaskBase* child);
-    void removeChild(TaskBase* child);
+    CORCURRENCY_API void addChild(TaskBase* child);
+    CORCURRENCY_API void removeChild(TaskBase* child);
 
     TaskPriority priority = TaskPriority::medium;
     std::string name;
@@ -124,22 +127,26 @@ struct ExecutionContext {
     Executor* executor = nullptr;
 };
 
-ExecutionContext& currentContext() noexcept;
+CORCURRENCY_API ExecutionContext& currentContext() noexcept;
 
 /// Enqueues `h` to resume on `executor` (the global concurrent executor if null),
 /// running as part of `task`.
-void schedule(Executor* executor, std::coroutine_handle<> h, TaskBase* task);
+CORCURRENCY_API void schedule(Executor* executor, std::coroutine_handle<> h, TaskBase* task);
 
 /// Calls `fn(ctx)` on a global queue after `nanoseconds`.
-void scheduleAfter(std::uint64_t nanoseconds, void (*fn)(void*), void* ctx);
+CORCURRENCY_API void scheduleAfter(std::uint64_t nanoseconds, void (*fn)(void*), void* ctx);
 
 /// Runs `h` synchronously on this thread as part of `task` (used by `Task::immediate`).
-void runInline(std::coroutine_handle<> h, TaskBase* task);
+CORCURRENCY_API void runInline(std::coroutine_handle<> h, TaskBase* task);
 
 /// Parks the main thread draining the main queue. Never returns.
-[[noreturn]] void dispatchMain();
+[[noreturn]] CORCURRENCY_API void dispatchMain();
 
-bool isMainThread() noexcept;
+CORCURRENCY_API bool isMainThread() noexcept;
+
+/// `TaskLocal` bindings of the current thread while it runs no task. Lives in
+/// the runtime, so every module of a process sees the same bindings.
+CORCURRENCY_API std::shared_ptr<const TaskLocalNode>& threadTaskLocals() noexcept;
 
 } // namespace detail
 
@@ -158,7 +165,7 @@ public:
 
     /// Resumes the job on the calling thread, treating `executor` as the current
     /// executor, then destroys the job.
-    void runSynchronously(Executor& executor);
+    CORCURRENCY_API void runSynchronously(Executor& executor);
 
 private:
     std::coroutine_handle<> handle_;
@@ -186,7 +193,7 @@ public:
 class TaskExecutor : public Executor {};
 
 /// A serial executor backed by a private serial dispatch queue.
-class DispatchSerialQueueExecutor final : public SerialExecutor {
+class CORCURRENCY_API DispatchSerialQueueExecutor final : public SerialExecutor {
 public:
     explicit DispatchSerialQueueExecutor(const char* label = nullptr);
     ~DispatchSerialQueueExecutor() override;
@@ -200,9 +207,16 @@ private:
 };
 
 /// The executor of `MainActor` (the main dispatch queue).
-SerialExecutor& mainExecutor();
+CORCURRENCY_API SerialExecutor& mainExecutor();
 
 /// The default executor for non-isolated tasks (global concurrent dispatch queues).
-TaskExecutor& globalConcurrentExecutor();
+CORCURRENCY_API TaskExecutor& globalConcurrentExecutor();
+
+namespace detail {
+/// The serial executor of the global actor `type` (`GlobalActor<Derived>`),
+/// created on first use. Kept in the runtime, so the actor is one actor even
+/// when it is used from several DLLs / shared libraries.
+CORCURRENCY_API SerialExecutor& globalActorExecutor(const std::type_info& type);
+} // namespace detail
 
 } // namespace corcurrency

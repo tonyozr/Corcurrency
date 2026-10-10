@@ -199,8 +199,8 @@ actor<T> enable_actor_from_this<T>::self() const {
 template <class Derived>
 struct GlobalActor {
     static SerialExecutor& sharedExecutor() {
-        static auto* executor = new DispatchSerialQueueExecutor(typeid(Derived).name());
-        return *executor;
+        static SerialExecutor& executor = detail::globalActorExecutor(typeid(Derived));
+        return executor;
     }
 
     /// `await Derived.run { ... }`

@@ -1,10 +1,12 @@
 // C++ Corcurrency — runtime implementation on top of libdispatch.
-#include <corcurrency/runtime.hpp>
+#include "include/corcurrency/runtime.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <thread>
+#include <typeindex>
 
 // SwiftPM does not put the Swift SDK's include directory on the C++ header
 // search path, so when <dispatch/dispatch.h> is not reachable we declare the
@@ -119,6 +121,11 @@ public:
 } // namespace
 
 ExecutionContext& currentContext() noexcept { return tlsContext; }
+
+std::shared_ptr<const TaskLocalNode>& threadTaskLocals() noexcept {
+    thread_local std::shared_ptr<const TaskLocalNode> locals;
+    return locals;
+}
 
 bool isMainThread() noexcept { return std::this_thread::get_id() == mainThreadId; }
 
@@ -244,6 +251,15 @@ SerialExecutor& mainExecutor() {
 
 TaskExecutor& globalConcurrentExecutor() {
     static auto* executor = new detail::GlobalConcurrentExecutor();
+    return *executor;
+}
+
+SerialExecutor& detail::globalActorExecutor(const std::type_info& type) {
+    static auto* mutex = new std::mutex();
+    static auto* executors = new std::map<std::type_index, SerialExecutor*>();
+    std::lock_guard lock(*mutex);
+    auto& executor = (*executors)[std::type_index(type)];
+    if (!executor) executor = new DispatchSerialQueueExecutor(type.name());
     return *executor;
 }
 

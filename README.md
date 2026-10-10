@@ -128,6 +128,37 @@ The public headers don't include `<dispatch/dispatch.h>`; only `runtime.cpp` tal
 header isn't on the include path (SwiftPM doesn't add the Swift SDK's include directory for C++ targets),
 the runtime declares the few libdispatch C functions it uses itself.
 
+### Other build systems
+
+SwiftPM is the only build that ships, but the library doesn't depend on it. To build Corcurrency with
+CMake, Meson, MSBuild or anything else:
+
+- compile `Sources/Corcurrency/runtime.cpp` as C++20;
+- add `Sources/Corcurrency/include` to the include path;
+- link libdispatch (`dispatch.lib` / `libdispatch.so` from the Swift SDK; built into the OS on Apple platforms).
+
+Compile `runtime.cpp` once per process: a second copy is a second runtime that doesn't see the first one's
+tasks and executors.
+
+A ready-made shared library is one command away:
+
+```sh
+swift build -c release --product CorcurrencyShared
+# -> .build/release/CorcurrencyShared.dll + .lib (Windows), libCorcurrencyShared.so, libCorcurrencyShared.dylib
+```
+
+Compile its users against `Sources/Corcurrency/include` with `CORCURRENCY_SHARED` defined, and link the
+library and libdispatch. On Windows the DLL built by SwiftPM also needs `swiftCore.dll` (SwiftPM links
+`swiftrt.obj` into every binary); a DLL built by another build system doesn't.
+
+As a static library or sources inside your project, nothing needs to be defined. As a shared library
+(.dll / .so / .dylib), define `CORCURRENCY_SHARED` for the library and all its users, and also
+`CORCURRENCY_BUILDING` while compiling `runtime.cpp`. `CORCURRENCY_API` (`corcurrency/config.hpp`) then
+exports the runtime with `dllexport`/`dllimport` on Windows and default visibility elsewhere, so you can
+build with `-fvisibility=hidden`. All state shared between modules lives in the runtime: the current task,
+task-local values outside tasks, and the executors of `GlobalActor`s. So one global actor stays one actor
+even when it's used from several DLLs.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
