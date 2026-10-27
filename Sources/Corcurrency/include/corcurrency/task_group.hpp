@@ -15,10 +15,13 @@
 
 #include <corcurrency/task.hpp>
 
-#include <deque>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace corcurrency {
 
@@ -40,100 +43,136 @@ inline TaskSpawnOptions childOptions(TaskBase* parent, std::optional<TaskPriorit
 }
 
 /// Shared state of a task group. `T` is the child result type.
+///
+/// Like `dispatch_group_t`, the counters live in one atomic word, so a child
+/// finishing and the parent suspending in `next()` agree without a lock and
+/// no wake-up is lost (the parent sets `waiting` only if nothing is ready,
+/// in the same compare-and-swap that reads the counts):
+///
+///     63          32 31          2      1         0
+///     ┌─────────────┬─────────────┬───────────┬─────────┐
+///     │   pending   │    ready    │ cancelled │ waiting │
+///     └─────────────┴─────────────┴───────────┴─────────┘
+///
+/// Results go on a lock-free stack that only the parent pops. The running
+/// children (needed by `cancelAll`) form an intrusive list under a mutex.
+/// Everything is O(1) per child except `cancelAll`, which is O(running).
 template <class T>
 class GroupState {
 public:
-    using Stored = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
-
     GroupState(TaskBase* parent, bool discardResults, bool throwing)
         : parent_(parent), discardResults_(discardResults), throwing_(throwing) {}
 
+    ~GroupState() {
+        freeNodes(stack_.load(std::memory_order_acquire));
+        freeNodes(local_);
+    }
+
     TaskBase* parent() const noexcept { return parent_; }
 
+    /// Parent cancellation reaches the children through a single cancellation
+    /// handler on the parent, instead of registering every child with it.
+    static void attachToParent(const std::shared_ptr<GroupState>& self) {
+        if (!self->parent_) return;
+        self->handlerId_ = TaskBase::makeHandlerId();
+        std::weak_ptr<GroupState> weak = self;
+        if (!self->parent_->addCancellationHandler(self->handlerId_, [weak] {
+                if (auto state = weak.lock()) state->cancelAll();
+            }))
+            self->cancelAll();
+    }
+
+    void detachFromParent() {
+        if (parent_) parent_->removeCancellationHandler(handlerId_);
+    }
+
     bool isCancelled() {
-        std::lock_guard lock(mutex_);
-        return cancelled_ || (parent_ && parent_->isCancelled());
+        return (status_.load(std::memory_order_acquire) & cancelledBit) || (parent_ && parent_->isCancelled());
     }
 
     bool isEmpty() {
-        std::lock_guard lock(mutex_);
-        return pending_ == 0 && ready_.empty();
+        auto s = status_.load(std::memory_order_acquire);
+        return pending(s) == 0 && ready(s) == 0;
     }
 
     /// Registers a new child (returns false if `onlyUnlessCancelled` and the group is cancelled).
     bool beginChild(bool onlyUnlessCancelled) {
-        std::lock_guard lock(mutex_);
-        if (onlyUnlessCancelled && (cancelled_ || (parent_ && parent_->isCancelled()))) return false;
-        ++pending_;
+        if (!onlyUnlessCancelled) {
+            status_.fetch_add(pendingOne, std::memory_order_relaxed);
+            return true;
+        }
+        if (parent_ && parent_->isCancelled()) return false;
+        auto s = status_.load(std::memory_order_relaxed);
+        do {
+            if (s & cancelledBit) return false;
+        } while (!status_.compare_exchange_weak(s, s + pendingOne, std::memory_order_relaxed));
         return true;
     }
 
-    void attachChild(TaskRef child) {
-        bool cancelNow;
+    /// Called before the child is started, so it cannot finish unregistered.
+    void attachChild(TaskBase* child) {
+        child->retain();
         {
             std::lock_guard lock(mutex_);
-            cancelNow = cancelled_;
-            running_.push_back(child);
+            child->groupPrev = nullptr;
+            child->groupNext = head_;
+            if (head_) head_->groupPrev = child;
+            head_ = child;
         }
-        if (parent_) parent_->addChild(child.get());
-        if (cancelNow) child->cancel();
+        if (status_.load(std::memory_order_acquire) & cancelledBit) child->cancel();
     }
 
     void childFinished(TaskBase* child, Result<T> result) {
-        std::optional<Waiter> waiter;
-        std::vector<TaskRef> toCancel;
-        {
-            std::lock_guard lock(mutex_);
-            --pending_;
-            std::erase_if(running_, [child](auto& c) { return c.get() == child; });
-            if (discardResults_) {
-                if (!result.isSuccess() && throwing_ && !firstError_) {
-                    firstError_ = result.error();
-                    cancelled_ = true;
-                    toCancel = running_;
-                }
-            } else {
-                ready_.push_back(std::move(result));
-            }
-            if (waiter_ && (!ready_.empty() || pending_ == 0)) {
-                waiter = std::move(waiter_);
-                waiter_.reset();
-            }
+        detachChild(child);
+        if (!discardResults_) {
+            push(new Node{nullptr, std::move(result)});
+        } else if (!result.isSuccess() && throwing_ && recordFirstError(result.error())) {
+            cancelAll();
         }
-        if (parent_) parent_->removeChild(child);
-        for (auto& c : toCancel) c->cancel();
-        if (waiter) waiter->resume();
+        auto s = status_.load(std::memory_order_relaxed);
+        std::uint64_t n;
+        do {
+            n = s - pendingOne + (discardResults_ ? 0 : readyOne);
+            if ((n & waitingBit) && canReturnNext(n)) n &= ~waitingBit;
+        } while (!status_.compare_exchange_weak(s, n, std::memory_order_acq_rel, std::memory_order_relaxed));
+        // We cleared `waiting`: the suspended parent is ours to resume.
+        if ((s & waitingBit) && !(n & waitingBit)) std::exchange(waiter_, {}).resume();
     }
 
     void cancelAll() {
+        status_.fetch_or(cancelledBit, std::memory_order_acq_rel);
         std::vector<TaskRef> running;
         {
             std::lock_guard lock(mutex_);
-            cancelled_ = true;
-            running = running_;
+            for (auto* child = head_; child; child = child->groupNext) running.emplace_back(child);
         }
         for (auto& c : running) c->cancel();
     }
 
     /// Awaiter for the next completed child (`nullopt` when the group is empty).
+    /// Only the group's parent awaits it.
     struct NextAwaiter {
         std::shared_ptr<GroupState> state;
-        bool await_ready() {
-            std::lock_guard lock(state->mutex_);
-            return !state->ready_.empty() || state->pending_ == 0;
+        bool await_ready() const noexcept {
+            return canReturnNext(state->status_.load(std::memory_order_acquire));
         }
         bool await_suspend(std::coroutine_handle<> h) {
-            std::lock_guard lock(state->mutex_);
-            if (!state->ready_.empty() || state->pending_ == 0) return false;
-            state->waiter_ = Waiter::current(h);
+            auto& st = *state;
+            st.waiter_ = Waiter::current(h);
+            auto s = st.status_.load(std::memory_order_acquire);
+            do {
+                if (canReturnNext(s)) {
+                    st.waiter_ = {};
+                    return false;
+                }
+            } while (!st.status_.compare_exchange_weak(s, s | waitingBit, std::memory_order_acq_rel,
+                                                       std::memory_order_acquire));
+            // A child may already be resuming us on another thread: don't touch `this`.
             return true;
         }
         std::optional<Result<T>> await_resume() {
-            std::lock_guard lock(state->mutex_);
-            if (state->ready_.empty()) return std::nullopt;
-            auto r = std::move(state->ready_.front());
-            state->ready_.pop_front();
-            return r;
+            if (ready(state->status_.load(std::memory_order_acquire)) == 0) return std::nullopt;
+            return state->pop();
         }
     };
 
@@ -143,15 +182,79 @@ public:
     }
 
 private:
-    std::mutex mutex_;
+    static constexpr std::uint64_t waitingBit = 1;
+    static constexpr std::uint64_t cancelledBit = 2;
+    static constexpr std::uint64_t readyOne = 4;
+    static constexpr std::uint64_t readyMask = 0xFFFF'FFFC;
+    static constexpr std::uint64_t pendingOne = std::uint64_t(1) << 32;
+
+    static std::uint64_t pending(std::uint64_t s) noexcept { return s >> 32; }
+    static std::uint64_t ready(std::uint64_t s) noexcept { return (s & readyMask) >> 2; }
+    /// `next()` can return without suspending.
+    static bool canReturnNext(std::uint64_t s) noexcept { return ready(s) != 0 || pending(s) == 0; }
+
+    struct Node {
+        Node* next;
+        Result<T> result;
+    };
+
+    static void freeNodes(Node* node) {
+        while (node) delete std::exchange(node, node->next);
+    }
+
+    void push(Node* node) {
+        node->next = stack_.load(std::memory_order_relaxed);
+        while (!stack_.compare_exchange_weak(node->next, node, std::memory_order_release,
+                                             std::memory_order_relaxed)) {
+        }
+    }
+
+    /// Parent only, when `ready > 0`: the oldest finished result.
+    Result<T> pop() {
+        if (!local_) {
+            // Take everything pushed so far and reverse it into completion order.
+            for (auto* node = stack_.exchange(nullptr, std::memory_order_acquire); node;) {
+                auto* next = node->next;
+                node->next = local_;
+                local_ = node;
+                node = next;
+            }
+        }
+        auto* node = std::exchange(local_, local_->next);
+        Result<T> result = std::move(node->result);
+        delete node;
+        status_.fetch_sub(readyOne, std::memory_order_relaxed);
+        return result;
+    }
+
+    void detachChild(TaskBase* child) {
+        {
+            std::lock_guard lock(mutex_);
+            if (child->groupPrev) child->groupPrev->groupNext = child->groupNext;
+            else head_ = child->groupNext;
+            if (child->groupNext) child->groupNext->groupPrev = child->groupPrev;
+            child->groupPrev = child->groupNext = nullptr;
+        }
+        child->release();
+    }
+
+    bool recordFirstError(std::exception_ptr e) {
+        std::lock_guard lock(mutex_);
+        if (firstError_) return false;
+        firstError_ = std::move(e);
+        return true;
+    }
+
     TaskBase* parent_;
     bool discardResults_;
     bool throwing_;
-    bool cancelled_ = false;
-    std::size_t pending_ = 0;
-    std::deque<Result<T>> ready_;
-    std::vector<TaskRef> running_;
-    std::optional<Waiter> waiter_;
+    std::uint64_t handlerId_ = 0;
+    std::atomic<std::uint64_t> status_{0};
+    std::atomic<Node*> stack_{nullptr}; // pushed by children, newest first
+    Node* local_ = nullptr;             // taken by the parent, oldest first
+    Waiter waiter_{};                   // valid while `waiting` is set
+    std::mutex mutex_;                  // guards the list below and `firstError_`
+    TaskBase* head_ = nullptr;          // running children (retained)
     std::exception_ptr firstError_;
 };
 
@@ -249,7 +352,10 @@ public:
 
     // Internal: created by `withTaskGroup` / `withThrowingTaskGroup`.
     explicit TaskGroup(detail::TaskBase* parent)
-        : state_(std::make_shared<detail::GroupState<ChildTaskResult>>(parent, false, true)) {}
+        : state_(std::make_shared<detail::GroupState<ChildTaskResult>>(parent, false, true)) {
+        detail::GroupState<ChildTaskResult>::attachToParent(state_);
+    }
+    ~TaskGroup() { state_->detachFromParent(); }
 
     // Internal: awaits (and discards) all remaining children.
     auto drain() -> async<void> {
@@ -262,13 +368,12 @@ private:
     template <class F>
     bool spawn(std::optional<TaskPriority> priority, F&& operation, bool unlessCancelled) {
         if (!state_->beginChild(unlessCancelled)) return false;
-        auto options = detail::childOptions(state_->parent(), priority);
-        auto child = detail::spawnTask<void>(
+        detail::spawnTask<void>(
             [state = state_, op = std::decay_t<F>(std::forward<F>(operation))]() mutable {
                 return detail::runGroupChild<ChildTaskResult>(state, std::move(op));
             },
-            std::move(options));
-        state_->attachChild(std::move(child));
+            detail::childOptions(state_->parent(), priority),
+            [this](const detail::TaskRef& child) { state_->attachChild(child.get()); });
         return true;
     }
 
@@ -306,7 +411,10 @@ public:
 
     // Internal: created by `with[Throwing]DiscardingTaskGroup`.
     DiscardingTaskGroup(detail::TaskBase* parent, bool throwing)
-        : state_(std::make_shared<detail::GroupState<void>>(parent, true, throwing)) {}
+        : state_(std::make_shared<detail::GroupState<void>>(parent, true, throwing)) {
+        detail::GroupState<void>::attachToParent(state_);
+    }
+    ~DiscardingTaskGroup() { state_->detachFromParent(); }
 
     // Internal.
     auto drain() -> async<void> {
@@ -320,12 +428,12 @@ private:
     template <class F>
     bool spawn(std::optional<TaskPriority> priority, F&& operation, bool unlessCancelled) {
         if (!state_->beginChild(unlessCancelled)) return false;
-        auto child = detail::spawnTask<void>(
+        detail::spawnTask<void>(
             [state = state_, op = std::decay_t<F>(std::forward<F>(operation))]() mutable {
                 return detail::runGroupChild<void>(state, std::move(op));
             },
-            detail::childOptions(state_->parent(), priority));
-        state_->attachChild(std::move(child));
+            detail::childOptions(state_->parent(), priority),
+            [this](const detail::TaskRef& child) { state_->attachChild(child.get()); });
         return true;
     }
 

@@ -102,6 +102,10 @@ public:
     std::shared_ptr<const TaskLocalNode> locals;
     /// Swift's task executor preference: where non-isolated child work runs.
     Executor* executorPreference = nullptr;
+    /// Links in the running-children list of the task group this task is a
+    /// child of (guarded by that group).
+    TaskBase* groupPrev = nullptr;
+    TaskBase* groupNext = nullptr;
 
 private:
     std::atomic<int> refs_{1};

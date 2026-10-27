@@ -370,6 +370,45 @@ TEST(parent_cancellation_propagates_to_group_children) {
     EXPECT(co_await task.value() == 3);
 }
 
+TEST(task_group_in_cancelled_parent_cancels_children) {
+    auto task = Task<int>::detached([]() -> async<int> {
+        while (!Task<>::isCancelled()) co_await Task<>::yield();
+        co_return co_await withTaskGroup<bool>([](TaskGroup<bool>& group) -> async<int> {
+            group.addTask([] { return Task<>::isCancelled(); });
+            co_return (co_await group.next()).value() ? 1 : 0;
+        });
+    });
+    task.cancel();
+    EXPECT(co_await task.value() == 1);
+}
+
+TEST(task_group_many_fast_children) {
+    // Most children finish before `addTask` returns; each must still be counted once.
+    long sum = co_await withTaskGroup<int>([](TaskGroup<int>& group) -> async<long> {
+        for (int i = 0; i < 20000; ++i) group.addTask([i] { return i; });
+        long total = 0;
+        for_await (int v, group) total += v;
+        co_return total;
+    });
+    EXPECT(sum == 20000L * 19999 / 2);
+}
+
+TEST(task_group_cancel_all_while_children_finish) {
+    int seen = co_await withTaskGroup<int>([](TaskGroup<int>& group) -> async<int> {
+        for (int i = 0; i < 2000; ++i) {
+            group.addTask([i]() -> async<int> {
+                if (i % 2) co_await Task<>::yield();
+                co_return 1;
+            });
+        }
+        group.cancelAll();
+        int n = 0;
+        while (auto r = co_await group.next()) n += *r;
+        co_return n;
+    });
+    EXPECT(seen == 2000);
+}
+
 TEST(discarding_task_group) {
     std::atomic<int> count{0};
     co_await withDiscardingTaskGroup([&](DiscardingTaskGroup& group) {

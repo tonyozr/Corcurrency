@@ -177,20 +177,28 @@ inline TaskSpawnOptions inheritedOptions() {
     return o;
 }
 
-template <class T, class F>
-TaskRef spawnTask(F&& f, TaskSpawnOptions options) {
+/// Creates a task, calls `beforeStart(task)` (to register it somewhere before
+/// it can run and finish), then starts it.
+template <class T, class F, class BeforeStart>
+TaskRef spawnTask(F&& f, TaskSpawnOptions options, BeforeStart&& beforeStart) {
     auto* state = new TaskState<T>();
     TaskRef ref(state, /*retain=*/false);
     state->priority = options.priority;
     state->locals = std::move(options.locals);
     state->name = std::move(options.name);
     auto co = runTaskBody<T>(ref, std::decay_t<F>(std::forward<F>(f)));
+    beforeStart(ref);
     if (options.immediate) {
         runInline(co.handle, state);
     } else {
         schedule(options.executor, co.handle, state);
     }
     return ref;
+}
+
+template <class T, class F>
+TaskRef spawnTask(F&& f, TaskSpawnOptions options) {
+    return spawnTask<T>(std::forward<F>(f), std::move(options), [](const TaskRef&) {});
 }
 
 template <class T>
@@ -225,6 +233,7 @@ public:
 
     bool await_suspend(std::coroutine_handle<> h) {
         auto& ctx = currentContext();
+        const auto nanoseconds = nanoseconds_; // `this` is gone once a cancellation handler can run
         auto st = std::make_shared<State>();
         st->handle = h;
         st->executor = ctx.executor;
@@ -243,7 +252,7 @@ public:
             }
         }
         // From here on `this` may already be resumed and destroyed.
-        scheduleAfter(nanoseconds_, &fire, new std::shared_ptr<State>(std::move(st)));
+        scheduleAfter(nanoseconds, &fire,new std::shared_ptr<State>(std::move(st)));
         return true;
     }
 
