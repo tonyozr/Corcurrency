@@ -224,6 +224,9 @@ public:
     }
 
     bool await_suspend(std::coroutine_handle<> h) {
+        // Read members before registering the cancellation handler: it may resume
+        // the coroutine on another thread and destroy this awaiter at once.
+        const auto nanoseconds = nanoseconds_;
         auto& ctx = currentContext();
         auto st = std::make_shared<State>();
         st->handle = h;
@@ -243,7 +246,7 @@ public:
             }
         }
         // From here on `this` may already be resumed and destroyed.
-        scheduleAfter(nanoseconds_, &fire, new std::shared_ptr<State>(std::move(st)));
+        scheduleAfter(nanoseconds, &fire, new std::shared_ptr<State>(std::move(st)));
         return true;
     }
 

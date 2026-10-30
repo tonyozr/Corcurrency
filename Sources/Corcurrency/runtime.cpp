@@ -177,7 +177,7 @@ void TaskBase::cancel() {
     {
         std::lock_guard lock(mutex_);
         handlers = handlers_;
-        children = children_;
+        children = children_.snapshot();
     }
     for (auto& [id, handler] : handlers) handler();
     for (auto& child : children) child->cancel();
@@ -203,7 +203,7 @@ void TaskBase::addChild(TaskBase* child) {
     {
         std::lock_guard lock(mutex_);
         if (!isCancelled()) {
-            children_.emplace_back(child);
+            children_.pushBack(child);
             return;
         }
     }
@@ -211,8 +211,9 @@ void TaskBase::addChild(TaskBase* child) {
 }
 
 void TaskBase::removeChild(TaskBase* child) {
+    TaskRef removed; // released after unlocking
     std::lock_guard lock(mutex_);
-    std::erase_if(children_, [child](auto& c) { return c.get() == child; });
+    removed = children_.remove(child);
 }
 
 } // namespace detail

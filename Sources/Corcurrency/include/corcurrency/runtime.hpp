@@ -61,6 +61,34 @@ private:
     TaskBase* ptr_ = nullptr;
 };
 
+/// Child tasks of a task group or of a task (`async let`): an intrusive
+/// doubly-linked list threaded through the tasks themselves, like Swift's
+/// `TaskGroupTaskStatusRecord`. O(1) insertion and removal, no allocation.
+/// A task is in at most one such list. Not synchronized: guard it with the
+/// owner's mutex.
+class ChildList {
+public:
+    ChildList() = default;
+    ChildList(const ChildList&) = delete;
+    ChildList& operator=(const ChildList&) = delete;
+
+    /// Links `child` and takes a reference to it. Returns false, linking
+    /// nothing, if `remove(child)` already ran: the child finished first.
+    bool pushBack(TaskBase* child) noexcept;
+    /// Unlinks `child` and hands over the list's reference (empty if `child`
+    /// was not linked). Release it outside the owner's lock.
+    TaskRef remove(TaskBase* child) noexcept;
+    /// New references to every linked child, to use outside the owner's lock.
+    std::vector<TaskRef> snapshot() const;
+    /// Unlinks every child and hands over the list's references.
+    std::vector<TaskRef> clear();
+    bool empty() const noexcept { return first_ == nullptr; }
+
+private:
+    TaskBase* first_ = nullptr;
+    TaskBase* last_ = nullptr;
+};
+
 /// Immutable linked list of `TaskLocal` bindings, shared between parent and child tasks.
 struct TaskLocalNode {
     const void* key;
@@ -93,7 +121,8 @@ public:
     CORCURRENCY_API bool addCancellationHandler(std::uint64_t id, std::function<void()> handler);
     CORCURRENCY_API void removeCancellationHandler(std::uint64_t id);
 
-    /// Structured children (task group / async let) are cancelled with the parent.
+    /// `async let` children are cancelled with the parent. (Task groups keep
+    /// their own children and follow the parent through a cancellation handler.)
     CORCURRENCY_API void addChild(TaskBase* child);
     CORCURRENCY_API void removeChild(TaskBase* child);
 
@@ -108,7 +137,14 @@ private:
     std::atomic<bool> cancelled_{false};
     std::mutex mutex_;
     std::vector<std::pair<std::uint64_t, std::function<void()>>> handlers_;
-    std::vector<TaskRef> children_;
+    ChildList children_;
+
+    // Membership in a ChildList, guarded by the mutex of that list's owner.
+    friend class ChildList;
+    enum class Link : std::uint8_t { none, linked, removed };
+    TaskBase* prevSibling_ = nullptr;
+    TaskBase* nextSibling_ = nullptr;
+    Link link_ = Link::none;
 };
 
 inline TaskRef::TaskRef(TaskBase* t, bool retain) noexcept : ptr_(t) {
@@ -119,6 +155,55 @@ inline TaskRef::TaskRef(const TaskRef& o) noexcept : ptr_(o.ptr_) {
 }
 inline TaskRef::~TaskRef() {
     if (ptr_) ptr_->release();
+}
+
+inline bool ChildList::pushBack(TaskBase* child) noexcept {
+    if (child->link_ == TaskBase::Link::removed) return false;
+    child->retain();
+    child->link_ = TaskBase::Link::linked;
+    child->prevSibling_ = last_;
+    child->nextSibling_ = nullptr;
+    if (last_) {
+        last_->nextSibling_ = child;
+    } else {
+        first_ = child;
+    }
+    last_ = child;
+    return true;
+}
+
+inline TaskRef ChildList::remove(TaskBase* child) noexcept {
+    if (child->link_ != TaskBase::Link::linked) {
+        child->link_ = TaskBase::Link::removed;
+        return {};
+    }
+    auto* prev = child->prevSibling_;
+    auto* next = child->nextSibling_;
+    if (prev) {
+        prev->nextSibling_ = next;
+    } else {
+        first_ = next;
+    }
+    if (next) {
+        next->prevSibling_ = prev;
+    } else {
+        last_ = prev;
+    }
+    child->prevSibling_ = child->nextSibling_ = nullptr;
+    child->link_ = TaskBase::Link::removed;
+    return TaskRef(child, /*retain=*/false);
+}
+
+inline std::vector<TaskRef> ChildList::snapshot() const {
+    std::vector<TaskRef> refs;
+    for (auto* c = first_; c; c = c->nextSibling_) refs.emplace_back(c);
+    return refs;
+}
+
+inline std::vector<TaskRef> ChildList::clear() {
+    std::vector<TaskRef> refs;
+    while (first_) refs.push_back(remove(first_));
+    return refs;
 }
 
 /// What is running on the current thread right now.
