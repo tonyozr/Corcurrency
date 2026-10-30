@@ -500,6 +500,24 @@ TEST(async_stream_termination_on_cancel) {
     EXPECT(terminatedByCancel.load());
 }
 
+TEST(async_stream_finishes_when_last_continuation_is_dropped) {
+    std::atomic<bool> finished{false};
+    AsyncStream<int> stream([&](AsyncStream<int>::Continuation c) {
+        c.onTermination([&](auto reason) { finished = reason == AsyncStream<int>::Termination::finished; });
+        Task<void>::detached([c]() -> async<void> {
+            for (int i = 1; i <= 3; ++i) {
+                c.yield(i);
+                co_await Task<>::sleep(1ms);
+            }
+            // No finish(): dropping the last copy of the continuation ends the stream.
+        });
+    });
+    std::vector<int> received;
+    for_await (int x, stream) received.push_back(x);
+    EXPECT((received == std::vector<int>{1, 2, 3}));
+    EXPECT(finished.load());
+}
+
 TEST(async_throwing_stream) {
     AsyncThrowingStream<int> stream([](auto c) {
         c.yield(1);

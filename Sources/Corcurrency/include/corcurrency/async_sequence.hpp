@@ -388,6 +388,24 @@ public:
 
     void finish(std::exception_ptr error = nullptr) { terminate(Termination::finished, error); }
 
+    /// Shared by every copy of a stream's continuation. Destroying the last
+    /// copy finishes the stream, as in Swift, so a consumer is never left
+    /// waiting on a stream that nobody can feed any more.
+    struct Producer {
+        std::shared_ptr<StreamState> state;
+        ~Producer() { state->finish(); }
+    };
+
+    static std::shared_ptr<Producer> producer(const std::shared_ptr<StreamState>& state) {
+        std::lock_guard lock(state->mutex_);
+        auto p = state->producer_.lock();
+        if (!p) {
+            p = std::shared_ptr<Producer>(new Producer{state});
+            state->producer_ = p;
+        }
+        return p;
+    }
+
     void setOnTermination(std::function<void(Termination)> handler) {
         std::lock_guard lock(mutex_);
         if (!finished_) onTermination_ = std::move(handler);
@@ -482,6 +500,7 @@ private:
     std::optional<Waiter> waiter_;
     std::uint64_t waiterHandlerId_ = 0;
     std::function<void(Termination)> onTermination_;
+    std::weak_ptr<Producer> producer_;
 };
 
 /// Shared implementation of AsyncStream / AsyncThrowingStream.
@@ -510,34 +529,35 @@ public:
     };
 
     /// Swift's `AsyncStream.Continuation` — the producer side. Copyable, thread-safe.
+    /// When the last copy is destroyed, the stream finishes (like `finish()`).
     class Continuation {
     public:
-        explicit Continuation(std::shared_ptr<State> s) : state_(std::move(s)) {}
+        explicit Continuation(const std::shared_ptr<State>& s) : producer_(State::producer(s)) {}
 
         YieldResult yield(Element value) const {
-            auto o = state_->yield(std::move(value));
+            auto o = producer_->state->yield(std::move(value));
             return {static_cast<typename YieldResult::Kind>(o.kind), o.remaining, std::move(o.droppedElement)};
         }
         /// `continuation.finish()`
-        void finish() const { state_->finish(); }
+        void finish() const { producer_->state->finish(); }
         /// `continuation.finish(throwing: error)` (AsyncThrowingStream only).
         void finish(std::exception_ptr error) const
             requires Throwing
         {
-            state_->finish(std::move(error));
+            producer_->state->finish(std::move(error));
         }
         template <class E>
             requires(Throwing && std::is_base_of_v<std::exception, std::remove_cvref_t<E>>)
         void finish(E&& error) const {
-            state_->finish(std::make_exception_ptr(std::forward<E>(error)));
+            producer_->state->finish(std::make_exception_ptr(std::forward<E>(error)));
         }
         /// `continuation.onTermination = { termination in ... }`
         void onTermination(std::function<void(Termination)> handler) const {
-            state_->setOnTermination(std::move(handler));
+            producer_->state->setOnTermination(std::move(handler));
         }
 
     private:
-        std::shared_ptr<State> state_;
+        std::shared_ptr<typename State::Producer> producer_;
     };
 
     class AsyncIterator {
