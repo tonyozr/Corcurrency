@@ -15,7 +15,7 @@
 
 #include <corcurrency/task.hpp>
 
-#include <deque>
+#include <list>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -364,26 +364,32 @@ public:
     };
 
     YieldOutcome yield(Element value) {
+        // Elements move in and out of the buffer only by splicing list nodes,
+        // which never throws, so none is constructed or destroyed under the lock.
+        std::list<Element> node;
+        node.push_back(std::move(value));
+        std::list<Element> evicted;
         std::optional<Waiter> waiter;
-        YieldOutcome outcome{YieldOutcome::enqueued};
+        std::size_t remaining = 0;
         {
             std::lock_guard lock(mutex_);
             if (finished_) return {YieldOutcome::terminated};
             if (policy_ == Policy::bufferingOldest && buffer_.size() >= limit_ && !waiter_) {
-                return {YieldOutcome::dropped, 0, std::move(value)};
+                evicted.swap(node);
+            } else {
+                buffer_.splice(buffer_.end(), node);
+                if (policy_ == Policy::bufferingNewest && buffer_.size() > limit_ && !waiter_) {
+                    evicted.splice(evicted.end(), buffer_, buffer_.begin());
+                }
+                if (policy_ != Policy::unbounded && evicted.empty()) {
+                    remaining = limit_ > buffer_.size() ? limit_ - buffer_.size() : 0;
+                }
+                waiter = takeWaiterLocked();
             }
-            buffer_.push_back(std::move(value));
-            if (policy_ == Policy::bufferingNewest && buffer_.size() > limit_ && !waiter_) {
-                outcome = {YieldOutcome::dropped, 0, std::move(buffer_.front())};
-                buffer_.pop_front();
-            }
-            if (policy_ != Policy::unbounded && outcome.kind == YieldOutcome::enqueued) {
-                outcome.remaining = limit_ > buffer_.size() ? limit_ - buffer_.size() : 0;
-            }
-            waiter = takeWaiterLocked();
         }
         if (waiter) waiter->resume();
-        return outcome;
+        if (!evicted.empty()) return {YieldOutcome::dropped, 0, std::move(evicted.front())};
+        return {YieldOutcome::enqueued, remaining};
     }
 
     void finish(std::exception_ptr error = nullptr) { terminate(Termination::finished, error); }
@@ -463,23 +469,25 @@ public:
             if (auto* task = currentContext().task; task && state->waiterHandlerId_) {
                 task->removeCancellationHandler(state->waiterHandlerId_);
             }
-            std::lock_guard lock(state->mutex_);
-            state->waiterHandlerId_ = 0;
-            if (!state->buffer_.empty()) {
-                auto v = std::move(state->buffer_.front());
-                state->buffer_.pop_front();
-                return v;
+            std::list<Element> taken;
+            std::exception_ptr error;
+            {
+                std::lock_guard lock(state->mutex_);
+                state->waiterHandlerId_ = 0;
+                if (!state->buffer_.empty()) {
+                    taken.splice(taken.end(), state->buffer_, state->buffer_.begin());
+                } else {
+                    error = std::exchange(state->error_, nullptr);
+                }
             }
-            if (state->error_) {
-                auto e = std::exchange(state->error_, nullptr);
-                std::rethrow_exception(e);
-            }
+            if (!taken.empty()) return std::move(taken.front());
+            if (error) std::rethrow_exception(error);
             return std::nullopt;
         }
     };
 
     void terminate(Termination reason, std::exception_ptr error) {
-        std::deque<Element> dropped;
+        std::list<Element> dropped;
         std::optional<Waiter> waiter;
         std::function<void(Termination)> handler;
         {
@@ -514,7 +522,7 @@ private:
     std::mutex mutex_;
     Policy policy_;
     std::size_t limit_;
-    std::deque<Element> buffer_;
+    std::list<Element> buffer_;
     bool finished_ = false;
     std::exception_ptr error_;
     std::optional<Waiter> waiter_;

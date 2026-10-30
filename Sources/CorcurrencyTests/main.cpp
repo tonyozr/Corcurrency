@@ -501,9 +501,13 @@ TEST(async_stream_termination_on_cancel) {
 }
 
 TEST(async_stream_finishes_when_last_continuation_is_dropped) {
-    std::atomic<bool> finished{false};
-    AsyncStream<int> stream([&](AsyncStream<int>::Continuation c) {
-        c.onTermination([&](auto reason) { finished = reason == AsyncStream<int>::Termination::finished; });
+    // 0: handler not called yet, 1: finished, 2: cancelled. Shared, so the
+    // handler never outlives what it writes to.
+    auto termination = std::make_shared<std::atomic<int>>(0);
+    AsyncStream<int> stream([termination](AsyncStream<int>::Continuation c) {
+        c.onTermination([termination](auto reason) {
+            *termination = reason == AsyncStream<int>::Termination::finished ? 1 : 2;
+        });
         Task<void>::detached([c]() -> async<void> {
             for (int i = 1; i <= 3; ++i) {
                 c.yield(i);
@@ -515,7 +519,9 @@ TEST(async_stream_finishes_when_last_continuation_is_dropped) {
     std::vector<int> received;
     for_await (int x, stream) received.push_back(x);
     EXPECT((received == std::vector<int>{1, 2, 3}));
-    EXPECT(finished.load());
+    // The consumer can see the end of the stream before the handler has run.
+    while (*termination == 0) co_await Task<>::sleep(1ms);
+    EXPECT(*termination == 1);
 }
 
 TEST(async_stream_cancel_drops_element_owning_last_continuation) {
