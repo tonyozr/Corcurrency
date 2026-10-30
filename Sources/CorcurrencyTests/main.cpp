@@ -518,6 +518,29 @@ TEST(async_stream_finishes_when_last_continuation_is_dropped) {
     EXPECT(finished.load());
 }
 
+TEST(async_stream_cancel_drops_element_owning_last_continuation) {
+    using Job = std::function<void()>;
+    auto [stream, continuation] = AsyncStream<Job>::makeStream();
+    auto consumer = Task<int>::detached([stream]() -> async<int> {
+        int n = 0;
+        for_await (Job job, stream) {
+            job();
+            ++n;
+            try {
+                co_await Task<>::sleep(10s);
+            } catch (const CancellationError&) {
+            }
+        }
+        co_return n;
+    });
+    continuation.yield([] {});
+    co_await Task<>::sleep(20ms); // the consumer now sleeps inside the loop body
+    continuation.yield([keep = continuation] {});
+    { auto last = std::move(continuation); } // the buffered job owns the last copy
+    consumer.cancel(); // next() drops the buffer; must not deadlock
+    EXPECT(co_await consumer.value() == 1);
+}
+
 TEST(async_throwing_stream) {
     AsyncThrowingStream<int> stream([](auto c) {
         c.yield(1);

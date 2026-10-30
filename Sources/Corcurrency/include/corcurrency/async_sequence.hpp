@@ -392,23 +392,27 @@ public:
     /// copy finishes the stream, as in Swift, so a consumer is never left
     /// waiting on a stream that nobody can feed any more.
     struct Producer {
-        std::shared_ptr<StreamState> state;
+        explicit Producer(std::shared_ptr<StreamState> s) : state(std::move(s)) {}
         ~Producer() { state->finish(); }
+        std::shared_ptr<StreamState> state;
     };
 
     static std::shared_ptr<Producer> producer(const std::shared_ptr<StreamState>& state) {
         std::lock_guard lock(state->mutex_);
         auto p = state->producer_.lock();
         if (!p) {
-            p = std::shared_ptr<Producer>(new Producer{state});
+            p = std::make_shared<Producer>(state); // a failed allocation never runs ~Producer under the lock
             state->producer_ = p;
         }
         return p;
     }
 
+    // Elements and handlers may own the last continuation, whose destruction
+    // finishes the stream and takes `mutex_`: never destroy them under the lock.
+
     void setOnTermination(std::function<void(Termination)> handler) {
         std::lock_guard lock(mutex_);
-        if (!finished_) onTermination_ = std::move(handler);
+        if (!finished_) std::swap(onTermination_, handler);
     }
 
     // MARK: consumer side
@@ -468,6 +472,7 @@ public:
     };
 
     void terminate(Termination reason, std::exception_ptr error) {
+        std::deque<Element> dropped;
         std::optional<Waiter> waiter;
         std::function<void(Termination)> handler;
         {
@@ -475,7 +480,7 @@ public:
             if (finished_) return;
             finished_ = true;
             error_ = error;
-            if (reason == Termination::cancelled) buffer_.clear();
+            if (reason == Termination::cancelled) dropped.swap(buffer_);
             handler = std::move(onTermination_);
             onTermination_ = nullptr;
             waiter = takeWaiterLocked();
