@@ -500,6 +500,55 @@ TEST(async_stream_termination_on_cancel) {
     EXPECT(terminatedByCancel.load());
 }
 
+TEST(async_stream_finishes_when_last_continuation_is_dropped) {
+    // 0: handler not called yet, 1: finished, 2: cancelled. Shared, so the
+    // handler never outlives what it writes to.
+    auto termination = std::make_shared<std::atomic<int>>(0);
+    AsyncStream<int> stream([termination](AsyncStream<int>::Continuation c) {
+        c.onTermination([termination](auto reason) {
+            *termination = reason == AsyncStream<int>::Termination::finished ? 1 : 2;
+        });
+        Task<void>::detached([c]() -> async<void> {
+            for (int i = 1; i <= 3; ++i) {
+                c.yield(i);
+                co_await Task<>::sleep(1ms);
+            }
+            // No finish(): dropping the last copy of the continuation ends the stream.
+        });
+    });
+    std::vector<int> received;
+    for_await (int x, stream) received.push_back(x);
+    EXPECT((received == std::vector<int>{1, 2, 3}));
+    // The consumer can see the end of the stream before the handler has run.
+    while (*termination == 0) co_await Task<>::sleep(1ms);
+    EXPECT(*termination == 1);
+}
+
+TEST(async_stream_cancel_drops_element_owning_last_continuation) {
+    using Job = std::function<void()>;
+    auto [stream, continuation] = AsyncStream<Job>::makeStream();
+    auto inBody = std::make_shared<std::atomic<bool>>(false);
+    auto consumer = Task<int>::detached([stream, inBody]() -> async<int> {
+        int n = 0;
+        for_await (Job job, stream) {
+            job();
+            ++n;
+            *inBody = true;
+            try {
+                co_await Task<>::sleep(10s);
+            } catch (const CancellationError&) {
+            }
+        }
+        co_return n;
+    });
+    continuation.yield([] {});
+    while (!*inBody) co_await Task<>::sleep(1ms); // the consumer is in the loop body, not in next()
+    continuation.yield([keep = continuation] {});
+    { auto last = std::move(continuation); } // the buffered job owns the last copy
+    consumer.cancel(); // next() drops the buffer; must not deadlock
+    EXPECT(co_await consumer.value() == 1);
+}
+
 TEST(async_throwing_stream) {
     AsyncThrowingStream<int> stream([](auto c) {
         c.yield(1);

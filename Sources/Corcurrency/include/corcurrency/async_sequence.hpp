@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -364,33 +365,68 @@ public:
     };
 
     YieldOutcome yield(Element value) {
+        Slot slot = box(std::move(value));
+        std::optional<Slot> evicted;
+        bool rejected = false;
         std::optional<Waiter> waiter;
-        YieldOutcome outcome{YieldOutcome::enqueued};
+        std::size_t remaining = 0;
         {
             std::lock_guard lock(mutex_);
             if (finished_) return {YieldOutcome::terminated};
             if (policy_ == Policy::bufferingOldest && buffer_.size() >= limit_ && !waiter_) {
-                return {YieldOutcome::dropped, 0, std::move(value)};
+                rejected = true;
+            } else {
+                buffer_.push_back(std::move(slot));
+                if (policy_ == Policy::bufferingNewest && buffer_.size() > limit_ && !waiter_) {
+                    evicted.emplace(std::move(buffer_.front()));
+                    buffer_.pop_front();
+                }
+                if (policy_ != Policy::unbounded && !evicted) {
+                    remaining = limit_ > buffer_.size() ? limit_ - buffer_.size() : 0;
+                }
+                waiter = takeWaiterLocked();
             }
-            buffer_.push_back(std::move(value));
-            if (policy_ == Policy::bufferingNewest && buffer_.size() > limit_ && !waiter_) {
-                outcome = {YieldOutcome::dropped, 0, std::move(buffer_.front())};
-                buffer_.pop_front();
-            }
-            if (policy_ != Policy::unbounded && outcome.kind == YieldOutcome::enqueued) {
-                outcome.remaining = limit_ > buffer_.size() ? limit_ - buffer_.size() : 0;
-            }
-            waiter = takeWaiterLocked();
         }
         if (waiter) waiter->resume();
-        return outcome;
+        if (rejected) return {YieldOutcome::dropped, 0, unbox(std::move(slot))};
+        if (evicted) return {YieldOutcome::dropped, 0, unbox(std::move(*evicted))};
+        return {YieldOutcome::enqueued, remaining};
     }
 
     void finish(std::exception_ptr error = nullptr) { terminate(Termination::finished, error); }
 
+    /// Shared by every copy of a stream's continuation. Destroying the last
+    /// copy finishes the stream, as in Swift, so a consumer is never left
+    /// waiting on a stream that nobody can feed any more.
+    struct Producer {
+        explicit Producer(std::shared_ptr<StreamState> s) : state(std::move(s)) {}
+        ~Producer() {
+            try {
+                state->finish();
+            } catch (...) {
+                // A throwing onTermination handler must not terminate the process
+                // from a destructor; the consumer has been resumed regardless.
+            }
+        }
+        std::shared_ptr<StreamState> state;
+    };
+
+    static std::shared_ptr<Producer> producer(const std::shared_ptr<StreamState>& state) {
+        std::lock_guard lock(state->mutex_);
+        auto p = state->producer_.lock();
+        if (!p) {
+            p = std::make_shared<Producer>(state); // a failed allocation never runs ~Producer under the lock
+            state->producer_ = p;
+        }
+        return p;
+    }
+
+    // Elements and handlers may own the last continuation, whose destruction
+    // finishes the stream and takes `mutex_`: never destroy them under the lock.
+
     void setOnTermination(std::function<void(Termination)> handler) {
         std::lock_guard lock(mutex_);
-        if (!finished_) onTermination_ = std::move(handler);
+        if (!finished_) std::swap(onTermination_, handler);
     }
 
     // MARK: consumer side
@@ -434,22 +470,26 @@ public:
             if (auto* task = currentContext().task; task && state->waiterHandlerId_) {
                 task->removeCancellationHandler(state->waiterHandlerId_);
             }
-            std::lock_guard lock(state->mutex_);
-            state->waiterHandlerId_ = 0;
-            if (!state->buffer_.empty()) {
-                auto v = std::move(state->buffer_.front());
-                state->buffer_.pop_front();
-                return v;
+            std::optional<Slot> taken;
+            std::exception_ptr error;
+            {
+                std::lock_guard lock(state->mutex_);
+                state->waiterHandlerId_ = 0;
+                if (!state->buffer_.empty()) {
+                    taken.emplace(std::move(state->buffer_.front()));
+                    state->buffer_.pop_front();
+                } else {
+                    error = std::exchange(state->error_, nullptr);
+                }
             }
-            if (state->error_) {
-                auto e = std::exchange(state->error_, nullptr);
-                std::rethrow_exception(e);
-            }
+            if (taken) return unbox(std::move(*taken));
+            if (error) std::rethrow_exception(error);
             return std::nullopt;
         }
     };
 
     void terminate(Termination reason, std::exception_ptr error) {
+        std::deque<Slot> dropped;
         std::optional<Waiter> waiter;
         std::function<void(Termination)> handler;
         {
@@ -457,16 +497,47 @@ public:
             if (finished_) return;
             finished_ = true;
             error_ = error;
-            if (reason == Termination::cancelled) buffer_.clear();
+            if (reason == Termination::cancelled) dropped.swap(buffer_);
             handler = std::move(onTermination_);
             onTermination_ = nullptr;
             waiter = takeWaiterLocked();
         }
-        if (handler) handler(reason);
-        if (waiter) waiter->resume();
+        std::exception_ptr handlerError;
+        if (handler) {
+            try {
+                handler(reason);
+            } catch (...) {
+                handlerError = std::current_exception();
+            }
+        }
+        if (waiter) waiter->resume(); // even if the handler threw
+        if (handlerError) std::rethrow_exception(handlerError);
     }
 
 private:
+    // An element may own the last continuation, so it must not be constructed
+    // or destroyed under `mutex_` (see Producer). Moves that cannot throw are
+    // safe there; an element whose move can throw is boxed outside the lock,
+    // and only the pointer moves under it.
+    static constexpr bool kBoxed = !std::is_nothrow_move_constructible_v<Element>;
+    using Slot = std::conditional_t<kBoxed, std::unique_ptr<Element>, Element>;
+
+    static Slot box(Element&& value) {
+        if constexpr (kBoxed) {
+            return std::make_unique<Element>(std::move(value));
+        } else {
+            return std::move(value);
+        }
+    }
+
+    static Element unbox(Slot&& slot) {
+        if constexpr (kBoxed) {
+            return std::move(*slot);
+        } else {
+            return std::move(slot);
+        }
+    }
+
     std::optional<Waiter> takeWaiterLocked() {
         std::optional<Waiter> w = std::move(waiter_);
         waiter_.reset();
@@ -476,12 +547,13 @@ private:
     std::mutex mutex_;
     Policy policy_;
     std::size_t limit_;
-    std::deque<Element> buffer_;
+    std::deque<Slot> buffer_;
     bool finished_ = false;
     std::exception_ptr error_;
     std::optional<Waiter> waiter_;
     std::uint64_t waiterHandlerId_ = 0;
     std::function<void(Termination)> onTermination_;
+    std::weak_ptr<Producer> producer_;
 };
 
 /// Shared implementation of AsyncStream / AsyncThrowingStream.
@@ -510,34 +582,35 @@ public:
     };
 
     /// Swift's `AsyncStream.Continuation` — the producer side. Copyable, thread-safe.
+    /// When the last copy is destroyed, the stream finishes (like `finish()`).
     class Continuation {
     public:
-        explicit Continuation(std::shared_ptr<State> s) : state_(std::move(s)) {}
+        explicit Continuation(const std::shared_ptr<State>& s) : producer_(State::producer(s)) {}
 
         YieldResult yield(Element value) const {
-            auto o = state_->yield(std::move(value));
+            auto o = producer_->state->yield(std::move(value));
             return {static_cast<typename YieldResult::Kind>(o.kind), o.remaining, std::move(o.droppedElement)};
         }
         /// `continuation.finish()`
-        void finish() const { state_->finish(); }
+        void finish() const { producer_->state->finish(); }
         /// `continuation.finish(throwing: error)` (AsyncThrowingStream only).
         void finish(std::exception_ptr error) const
             requires Throwing
         {
-            state_->finish(std::move(error));
+            producer_->state->finish(std::move(error));
         }
         template <class E>
             requires(Throwing && std::is_base_of_v<std::exception, std::remove_cvref_t<E>>)
         void finish(E&& error) const {
-            state_->finish(std::make_exception_ptr(std::forward<E>(error)));
+            producer_->state->finish(std::make_exception_ptr(std::forward<E>(error)));
         }
         /// `continuation.onTermination = { termination in ... }`
         void onTermination(std::function<void(Termination)> handler) const {
-            state_->setOnTermination(std::move(handler));
+            producer_->state->setOnTermination(std::move(handler));
         }
 
     private:
-        std::shared_ptr<State> state_;
+        std::shared_ptr<typename State::Producer> producer_;
     };
 
     class AsyncIterator {
