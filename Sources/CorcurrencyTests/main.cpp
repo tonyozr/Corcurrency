@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -373,13 +374,13 @@ TEST(parent_cancellation_propagates_to_group_children) {
 TEST(task_group_with_many_children) {
     // Child bookkeeping is O(1) per child; with O(n) removal this took seconds.
     constexpr int n = 100000;
-    auto sum = co_await withTaskGroup<long>([](TaskGroup<long>& group) -> async<long> {
-        for (int i = 0; i < n; ++i) group.addTask([i]() -> async<long> { co_return i; });
-        long total = 0;
-        for_await (long x, group) total += x;
+    auto sum = co_await withTaskGroup<std::int64_t>([](TaskGroup<std::int64_t>& group) -> async<std::int64_t> {
+        for (int i = 0; i < n; ++i) group.addTask([i]() -> async<std::int64_t> { co_return i; });
+        std::int64_t total = 0;
+        for_await (std::int64_t x, group) total += x;
         co_return total;
     });
-    EXPECT(sum == static_cast<long>(n) * (n - 1) / 2);
+    EXPECT(sum == std::int64_t{n} * (n - 1) / 2);
 
     std::atomic<int> ran{0};
     co_await withDiscardingTaskGroup([&](DiscardingTaskGroup& group) {
