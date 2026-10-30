@@ -393,7 +393,14 @@ public:
     /// waiting on a stream that nobody can feed any more.
     struct Producer {
         explicit Producer(std::shared_ptr<StreamState> s) : state(std::move(s)) {}
-        ~Producer() { state->finish(); }
+        ~Producer() {
+            try {
+                state->finish();
+            } catch (...) {
+                // A throwing onTermination handler must not terminate the process
+                // from a destructor; the consumer has been resumed regardless.
+            }
+        }
         std::shared_ptr<StreamState> state;
     };
 
@@ -485,8 +492,16 @@ public:
             onTermination_ = nullptr;
             waiter = takeWaiterLocked();
         }
-        if (handler) handler(reason);
-        if (waiter) waiter->resume();
+        std::exception_ptr handlerError;
+        if (handler) {
+            try {
+                handler(reason);
+            } catch (...) {
+                handlerError = std::current_exception();
+            }
+        }
+        if (waiter) waiter->resume(); // even if the handler threw
+        if (handlerError) std::rethrow_exception(handlerError);
     }
 
 private:
