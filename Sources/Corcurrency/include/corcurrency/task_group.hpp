@@ -45,8 +45,32 @@ class GroupState {
 public:
     using Stored = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
 
+    /// Creates a group of `parent`'s children that is cancelled with `parent`.
+    static std::shared_ptr<GroupState> make(TaskBase* parent, bool discardResults, bool throwing) {
+        auto state = std::make_shared<GroupState>(parent, discardResults, throwing);
+        if (parent) {
+            state->parentHandlerId_ = TaskBase::makeHandlerId();
+            std::weak_ptr<GroupState> weak = state;
+            if (!parent->addCancellationHandler(state->parentHandlerId_, [weak] {
+                    if (auto s = weak.lock()) s->cancelAll();
+                })) {
+                state->parentHandlerId_ = 0;
+                state->cancelled_ = true; // the parent is already cancelled
+            }
+        }
+        return state;
+    }
+
     GroupState(TaskBase* parent, bool discardResults, bool throwing)
         : parent_(parent), discardResults_(discardResults), throwing_(throwing) {}
+
+    ~GroupState() { auto rest = children_.clear(); }
+
+    /// Stops following the parent's cancellation. Call while the parent is
+    /// alive, when the `with...TaskGroup` scope ends.
+    void detachFromParent() {
+        if (parent_ && parentHandlerId_) parent_->removeCancellationHandler(std::exchange(parentHandlerId_, 0));
+    }
 
     TaskBase* parent() const noexcept { return parent_; }
 
@@ -72,25 +96,25 @@ public:
         bool cancelNow;
         {
             std::lock_guard lock(mutex_);
-            cancelNow = cancelled_;
-            running_.push_back(child);
+            // A child that already finished (and was removed) is not linked.
+            cancelNow = children_.pushBack(child.get()) && cancelled_;
         }
-        if (parent_) parent_->addChild(child.get());
         if (cancelNow) child->cancel();
     }
 
     void childFinished(TaskBase* child, Result<T> result) {
+        TaskRef removed; // released after unlocking
         std::optional<Waiter> waiter;
         std::vector<TaskRef> toCancel;
         {
             std::lock_guard lock(mutex_);
             --pending_;
-            std::erase_if(running_, [child](auto& c) { return c.get() == child; });
+            removed = children_.remove(child);
             if (discardResults_) {
                 if (!result.isSuccess() && throwing_ && !firstError_) {
                     firstError_ = result.error();
                     cancelled_ = true;
-                    toCancel = running_;
+                    toCancel = children_.snapshot();
                 }
             } else {
                 ready_.push_back(std::move(result));
@@ -100,7 +124,6 @@ public:
                 waiter_.reset();
             }
         }
-        if (parent_) parent_->removeChild(child);
         for (auto& c : toCancel) c->cancel();
         if (waiter) waiter->resume();
     }
@@ -110,7 +133,7 @@ public:
         {
             std::lock_guard lock(mutex_);
             cancelled_ = true;
-            running = running_;
+            running = children_.snapshot();
         }
         for (auto& c : running) c->cancel();
     }
@@ -150,9 +173,10 @@ private:
     bool cancelled_ = false;
     std::size_t pending_ = 0;
     std::deque<Result<T>> ready_;
-    std::vector<TaskRef> running_;
+    ChildList children_;
     std::optional<Waiter> waiter_;
     std::exception_ptr firstError_;
+    std::uint64_t parentHandlerId_ = 0;
 };
 
 template <class T, class F>
@@ -249,7 +273,8 @@ public:
 
     // Internal: created by `withTaskGroup` / `withThrowingTaskGroup`.
     explicit TaskGroup(detail::TaskBase* parent)
-        : state_(std::make_shared<detail::GroupState<ChildTaskResult>>(parent, false, true)) {}
+        : state_(detail::GroupState<ChildTaskResult>::make(parent, false, true)) {}
+    ~TaskGroup() { state_->detachFromParent(); }
 
     // Internal: awaits (and discards) all remaining children.
     auto drain() -> async<void> {
@@ -306,7 +331,8 @@ public:
 
     // Internal: created by `with[Throwing]DiscardingTaskGroup`.
     DiscardingTaskGroup(detail::TaskBase* parent, bool throwing)
-        : state_(std::make_shared<detail::GroupState<void>>(parent, true, throwing)) {}
+        : state_(detail::GroupState<void>::make(parent, true, throwing)) {}
+    ~DiscardingTaskGroup() { state_->detachFromParent(); }
 
     // Internal.
     auto drain() -> async<void> {

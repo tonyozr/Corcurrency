@@ -370,6 +370,24 @@ TEST(parent_cancellation_propagates_to_group_children) {
     EXPECT(co_await task.value() == 3);
 }
 
+TEST(task_group_with_many_children) {
+    // Child bookkeeping is O(1) per child; with O(n) removal this took seconds.
+    constexpr int n = 100000;
+    auto sum = co_await withTaskGroup<long>([](TaskGroup<long>& group) -> async<long> {
+        for (int i = 0; i < n; ++i) group.addTask([i]() -> async<long> { co_return i; });
+        long total = 0;
+        for_await (long x, group) total += x;
+        co_return total;
+    });
+    EXPECT(sum == static_cast<long>(n) * (n - 1) / 2);
+
+    std::atomic<int> ran{0};
+    co_await withDiscardingTaskGroup([&](DiscardingTaskGroup& group) {
+        for (int i = 0; i < n; ++i) group.addTask([&]() -> async<void> { ran.fetch_add(1); co_return; });
+    });
+    EXPECT(ran.load() == n);
+}
+
 TEST(discarding_task_group) {
     std::atomic<int> count{0};
     co_await withDiscardingTaskGroup([&](DiscardingTaskGroup& group) {
