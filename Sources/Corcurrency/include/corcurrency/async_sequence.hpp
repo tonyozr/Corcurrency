@@ -15,11 +15,12 @@
 
 #include <corcurrency/task.hpp>
 
-#include <list>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -364,31 +365,31 @@ public:
     };
 
     YieldOutcome yield(Element value) {
-        // Elements move in and out of the buffer only by splicing list nodes,
-        // which never throws, so none is constructed or destroyed under the lock.
-        std::list<Element> node;
-        node.push_back(std::move(value));
-        std::list<Element> evicted;
+        Slot slot = box(std::move(value));
+        std::optional<Slot> evicted;
+        bool rejected = false;
         std::optional<Waiter> waiter;
         std::size_t remaining = 0;
         {
             std::lock_guard lock(mutex_);
             if (finished_) return {YieldOutcome::terminated};
             if (policy_ == Policy::bufferingOldest && buffer_.size() >= limit_ && !waiter_) {
-                evicted.swap(node);
+                rejected = true;
             } else {
-                buffer_.splice(buffer_.end(), node);
+                buffer_.push_back(std::move(slot));
                 if (policy_ == Policy::bufferingNewest && buffer_.size() > limit_ && !waiter_) {
-                    evicted.splice(evicted.end(), buffer_, buffer_.begin());
+                    evicted.emplace(std::move(buffer_.front()));
+                    buffer_.pop_front();
                 }
-                if (policy_ != Policy::unbounded && evicted.empty()) {
+                if (policy_ != Policy::unbounded && !evicted) {
                     remaining = limit_ > buffer_.size() ? limit_ - buffer_.size() : 0;
                 }
                 waiter = takeWaiterLocked();
             }
         }
         if (waiter) waiter->resume();
-        if (!evicted.empty()) return {YieldOutcome::dropped, 0, std::move(evicted.front())};
+        if (rejected) return {YieldOutcome::dropped, 0, unbox(std::move(slot))};
+        if (evicted) return {YieldOutcome::dropped, 0, unbox(std::move(*evicted))};
         return {YieldOutcome::enqueued, remaining};
     }
 
@@ -469,25 +470,26 @@ public:
             if (auto* task = currentContext().task; task && state->waiterHandlerId_) {
                 task->removeCancellationHandler(state->waiterHandlerId_);
             }
-            std::list<Element> taken;
+            std::optional<Slot> taken;
             std::exception_ptr error;
             {
                 std::lock_guard lock(state->mutex_);
                 state->waiterHandlerId_ = 0;
                 if (!state->buffer_.empty()) {
-                    taken.splice(taken.end(), state->buffer_, state->buffer_.begin());
+                    taken.emplace(std::move(state->buffer_.front()));
+                    state->buffer_.pop_front();
                 } else {
                     error = std::exchange(state->error_, nullptr);
                 }
             }
-            if (!taken.empty()) return std::move(taken.front());
+            if (taken) return unbox(std::move(*taken));
             if (error) std::rethrow_exception(error);
             return std::nullopt;
         }
     };
 
     void terminate(Termination reason, std::exception_ptr error) {
-        std::list<Element> dropped;
+        std::deque<Slot> dropped;
         std::optional<Waiter> waiter;
         std::function<void(Termination)> handler;
         {
@@ -513,6 +515,29 @@ public:
     }
 
 private:
+    // An element may own the last continuation, so it must not be constructed
+    // or destroyed under `mutex_` (see Producer). Moves that cannot throw are
+    // safe there; an element whose move can throw is boxed outside the lock,
+    // and only the pointer moves under it.
+    static constexpr bool kBoxed = !std::is_nothrow_move_constructible_v<Element>;
+    using Slot = std::conditional_t<kBoxed, std::unique_ptr<Element>, Element>;
+
+    static Slot box(Element&& value) {
+        if constexpr (kBoxed) {
+            return std::make_unique<Element>(std::move(value));
+        } else {
+            return std::move(value);
+        }
+    }
+
+    static Element unbox(Slot&& slot) {
+        if constexpr (kBoxed) {
+            return std::move(*slot);
+        } else {
+            return std::move(slot);
+        }
+    }
+
     std::optional<Waiter> takeWaiterLocked() {
         std::optional<Waiter> w = std::move(waiter_);
         waiter_.reset();
@@ -522,7 +547,7 @@ private:
     std::mutex mutex_;
     Policy policy_;
     std::size_t limit_;
-    std::list<Element> buffer_;
+    std::deque<Slot> buffer_;
     bool finished_ = false;
     std::exception_ptr error_;
     std::optional<Waiter> waiter_;
